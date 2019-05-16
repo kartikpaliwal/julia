@@ -383,6 +383,8 @@ JL_DLLEXPORT jl_task_t *jl_task_get_next(jl_value_t *getsticky)
             if (task)
                 return task;
             // one thread should win this race and watch the event loop
+            // inside a threaded region, any thread can listen for IO messages,
+            // although none are allowed to create new ones
             if (_threadedregion) {
                 if (jl_mutex_trylock(&jl_uv_mutex)) {
                     if (jl_atomic_load(&jl_uv_n_waiters) != 0) {
@@ -391,6 +393,11 @@ JL_DLLEXPORT jl_task_t *jl_task_get_next(jl_value_t *getsticky)
                         JL_UV_UNLOCK();
                     }
                     else {
+                        task = get_next_task(getsticky);
+                        if (task) {
+                            JL_UV_UNLOCK();
+                            return task;
+                        }
                         uv_loop_t *loop = jl_global_event_loop();
                         loop->stop_flag = 0;
                         uv_run(loop, UV_RUN_ONCE);
@@ -412,8 +419,18 @@ JL_DLLEXPORT jl_task_t *jl_task_get_next(jl_value_t *getsticky)
                 }
             }
             else if (ptls->tid == 0) {
-                if (jl_run_once(jl_global_event_loop()) != 0)
-                    continue;
+                // outside of threaded regions, all IO is permitted,
+                // but only on thread 1
+                JL_UV_LOCK();
+                task = get_next_task(getsticky);
+                if (task) {
+                    JL_UV_UNLOCK();
+                    return task;
+                }
+                uv_loop_t *loop = jl_global_event_loop();
+                loop->stop_flag = 0;
+                uv_run(loop, UV_RUN_ONCE);
+                JL_UV_UNLOCK();
                 // optimization: check again first if we added work for ourself
                 task = get_next_task(getsticky);
                 if (task)
