@@ -385,62 +385,54 @@ JL_DLLEXPORT jl_task_t *jl_task_get_next(jl_value_t *getsticky)
             // one thread should win this race and watch the event loop
             // inside a threaded region, any thread can listen for IO messages,
             // although none are allowed to create new ones
+            // outside of threaded regions, all IO is permitted,
+            // but only on thread 1
+            int uvlock = 0;
             if (_threadedregion) {
-                if (jl_mutex_trylock(&jl_uv_mutex)) {
-                    if (jl_atomic_load(&jl_uv_n_waiters) != 0) {
-                        // but if we won the race against someone who actually needs
-                        // the lock, we need to let them have it instead
-                        JL_UV_UNLOCK();
-                    }
-                    else {
-                        task = get_next_task(getsticky);
-                        if (task) {
-                            JL_UV_UNLOCK();
-                            return task;
-                        }
-                        uv_loop_t *loop = jl_global_event_loop();
-                        loop->stop_flag = 0;
-                        uv_run(loop, UV_RUN_ONCE);
-                        JL_UV_UNLOCK();
-                        // optimization: check again first if we added work for ourself
-                        task = get_next_task(getsticky);
-                        if (task)
-                            return task;
-                        // or someone else might have
-                        if (jl_atomic_load(&sleep_check_state) != sleeping) {
-                            start_cycles = 0;
-                            continue;
-                        }
-                        // otherwise, we got a spurious wakeup since some other
-                        // thread just wanted to steal libuv from us,
-                        // just go right back to sleep on the other wake signal
-                        // to let them take it from us without conflict
-                    }
-                }
+                uvlock = jl_mutex_trylock(&jl_uv_mutex);
             }
             else if (ptls->tid == 0) {
-                // outside of threaded regions, all IO is permitted,
-                // but only on thread 1
+                uvlock = 1;
                 JL_UV_LOCK();
-                task = get_next_task(getsticky);
-                if (task) {
+            }
+            if (uvlock) {
+                int active = 1;
+                if (jl_atomic_load(&jl_uv_n_waiters) != 0) {
+                    // but if we won the race against someone who actually needs
+                    // the lock to do real work, we need to let them have it instead
                     JL_UV_UNLOCK();
-                    return task;
                 }
-                uv_loop_t *loop = jl_global_event_loop();
-                loop->stop_flag = 0;
-                uv_run(loop, UV_RUN_ONCE);
-                JL_UV_UNLOCK();
-                // optimization: check again first if we added work for ourself
-                task = get_next_task(getsticky);
-                if (task)
-                    return task;
-                // or someone else might have
-                if (jl_atomic_load(&sleep_check_state) != sleeping) {
+                else {
+                    // otherwise, block until someone asks us for the lock
+                    task = get_next_task(getsticky);
+                    if (task) {
+                        JL_UV_UNLOCK();
+                        return task;
+                    }
+                    uv_loop_t *loop = jl_global_event_loop();
+                    loop->stop_flag = 0;
+                    active = uv_run(loop, UV_RUN_ONCE);
+                    JL_UV_UNLOCK();
+                    // optimization: check again first if we added work for ourself
+                    task = get_next_task(getsticky);
+                    if (task)
+                        return task;
+                    // or someone else might have
+                    if (jl_atomic_load(&sleep_check_state) != sleeping) {
+                        start_cycles = 0;
+                        continue;
+                    }
+                    // otherwise, we got a spurious wakeup since some other
+                    // thread just wanted to steal libuv from us,
+                    // just go right back to sleep on the other wake signal
+                    // to let them take it from us without conflict
+                }
+                if (!_threadedregion && active && ptls->tid == 0) {
+                    // thread 0 is the only thread permitted to run the event loop
+                    // so it needs to stay alive
                     start_cycles = 0;
                     continue;
                 }
-                // otherwise nothing to do, so just go to sleep
             }
             // the other threads will just wait for on signal to resume
             int8_t gc_state = jl_gc_safe_enter(ptls);
