@@ -184,7 +184,7 @@ end
 
 # NOTE: you can only wait for scheduled tasks
 function wait(t::Task)
-    t === current_task() && error("deadlock detected")
+    t === current_task() && error("deadlock detected: cannot wait on current task")
     if !istaskdone(t)
         lock(t.donenotify)
         try
