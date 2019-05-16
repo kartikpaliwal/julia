@@ -47,13 +47,12 @@ static int16_t heap_p;
 static uint64_t cong_unbias;
 
 static const int16_t not_sleeping = 0; // no thread should be sleeping--there might be work in the multi-queue
-static const int16_t checking_for_sleeping = 1; // some threads are checking the multi-queue to see if it is safe to transition to sleeping
-static const int16_t sleeping = 2; // it is acceptable for a thread to be sleeping if it's sticky queue is empty
+static const int16_t sleeping = 1; // it is acceptable for a thread to be sleeping if it's sticky queue is empty
+//static const int16_t checking_for_sleeping = sleeping + 1 + tid; // thread tid is checking the multi-queue to see if it is safe to transition to sleeping
+
 static int16_t sleep_check_state; // status of the multi-queue
 
 
-/*  multiq_init()
- */
 static inline void multiq_init(void)
 {
     heap_p = heap_c * jl_n_threads;
@@ -68,8 +67,6 @@ static inline void multiq_init(void)
 }
 
 
-/*  sift_up()
- */
 static inline void sift_up(taskheap_t *heap, int16_t idx)
 {
     if (idx > 0) {
@@ -84,8 +81,6 @@ static inline void sift_up(taskheap_t *heap, int16_t idx)
 }
 
 
-/*  sift_down()
- */
 static inline void sift_down(taskheap_t *heap, int16_t idx)
 {
     if (idx < heap->ntasks) {
@@ -104,8 +99,6 @@ static inline void sift_down(taskheap_t *heap, int16_t idx)
 }
 
 
-/*  multiq_insert()
- */
 static inline int multiq_insert(jl_task_t *task, int16_t priority)
 {
     jl_ptls_t ptls = jl_get_ptls_states();
@@ -133,8 +126,6 @@ static inline int multiq_insert(jl_task_t *task, int16_t priority)
 }
 
 
-/*  multiq_deletemin()
- */
 static inline jl_task_t *multiq_deletemin(void)
 {
     jl_ptls_t ptls = jl_get_ptls_states();
@@ -194,27 +185,28 @@ static int snapshot(void)
 }
 
 
-static int sleep_check_now(void)
+static int sleep_check_now(int16_t tid)
 {
     while (1) {
         int16_t state = jl_atomic_load(&sleep_check_state);
-        if (state == checking_for_sleeping) {
+        if (state > sleeping) {
             // if some thread is already checking, the decision of that thread
             // is correct for us also
             do {
                 state = jl_atomic_load(&sleep_check_state);
-            } while (state == checking_for_sleeping);
+            } while (state > sleeping);
             if (state == not_sleeping)
                 return 0;
         }
         else if (state == not_sleeping) {
+            int16_t checking_for_sleeping = sleeping + 1 + tid;
             // transition from sleeping ==> checking
             if (jl_atomic_bool_compare_exchange(&sleep_check_state, not_sleeping,
                                                 checking_for_sleeping)) {
                 if (snapshot()) {
                     // transition from checking ==> sleeping
                     if (jl_atomic_bool_compare_exchange(&sleep_check_state, checking_for_sleeping,
-                                                    sleeping))
+                                                        sleeping))
                         return 1;
                 }
                 else {
@@ -295,9 +287,9 @@ static int sleep_check_after_threshold(uint64_t *start_cycles)
 }
 
 
-static void wake_thread(jl_ptls_t ptls, int16_t tid)
+static void wake_thread(int16_t self, int16_t tid)
 {
-    if (ptls->tid != tid) {
+    if (self != tid) {
         jl_ptls_t other = jl_all_tls_states[tid];
         uv_mutex_lock(&other->sleep_lock);
         uv_cond_signal(&other->wake_signal);
@@ -308,11 +300,11 @@ static void wake_thread(jl_ptls_t ptls, int16_t tid)
 /* ensure thread tid is awake if necessary */
 JL_DLLEXPORT void jl_wakeup_thread(int16_t tid)
 {
-    jl_ptls_t ptls = jl_get_ptls_states();
+    int16_t self = jl_get_ptls_states()->tid;
     int16_t uvlock = jl_atomic_load_acquire(&jl_uv_mutex.owner);
-    if (tid == ptls->tid) {
+    if (tid == self) {
         // we're already awake, but make sure we'll exit uv_run
-        if (uvlock == ptls->tid)
+        if (uvlock == self)
             uv_stop(jl_global_event_loop());
     }
     else {
@@ -320,18 +312,20 @@ JL_DLLEXPORT void jl_wakeup_thread(int16_t tid)
         if (jl_atomic_load_acquire(&sleep_check_state) != not_sleeping) {
             if (tid == -1) {
                 // something added to the multi-queue: notify all threads
+                // in the future, we might want to instead wake some fraction of threads,
+                // and let each of those wake additional threads if they find work
                 int16_t state = jl_atomic_exchange(&sleep_check_state, not_sleeping);
-                if (state != not_sleeping) {
+                if (state == sleeping) {
                     for (tid = 0; tid < jl_n_threads; tid++)
-                        wake_thread(ptls, tid);
+                        wake_thread(self, tid);
                 }
             }
             else {
                 // something added to the sticky-queue: notify that thread
-                wake_thread(ptls, tid);
+                wake_thread(self, tid);
             }
             // check if we need to notify uv_run too
-            if (uvlock != ptls->tid)
+            if (uvlock != self)
                 jl_wake_libuv();
         }
     }
@@ -351,6 +345,8 @@ static jl_task_t *get_next_task(jl_value_t *getsticky)
     jl_task_t *task = (jl_task_t*)jl_apply(&getsticky, 1);
     if (jl_typeis(task, jl_task_type)) {
         int self = jl_get_ptls_states()->tid;
+        // try to acquire the lock on this task now
+        // we'll check this error later (in yieldto)
         if (jl_atomic_load_acquire(&task->tid) != self) {
             jl_atomic_compare_exchange(&task->tid, -1, self);
         }
@@ -381,7 +377,7 @@ JL_DLLEXPORT jl_task_t *jl_task_get_next(jl_value_t *getsticky)
 
         jl_cpu_pause();
         if (sleep_check_after_threshold(&start_cycles) || (!_threadedregion && ptls->tid == 0)) {
-            if (!sleep_check_now())
+            if (!sleep_check_now(ptls->tid))
                 continue;
             task = get_next_task(getsticky);
             if (task)
@@ -455,8 +451,9 @@ JL_DLLEXPORT jl_task_t *jl_task_get_next(jl_value_t *getsticky)
 
 void jl_gc_mark_enqueued_tasks(jl_gc_mark_cache_t *gc_cache, jl_gc_mark_sp_t *sp)
 {
-    for (int16_t i = 0; i < heap_p; ++i)
-        for (int16_t j = 0; j < heaps[i].ntasks; ++j)
+    int16_t i, j;
+    for (i = 0; i < heap_p; ++i)
+        for (j = 0; j < heaps[i].ntasks; ++j)
             jl_gc_mark_queue_obj_explicit(gc_cache, sp, (jl_value_t *)heaps[i].tasks[j]);
 }
 
