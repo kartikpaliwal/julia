@@ -398,6 +398,7 @@ const StickyWorkqueue = InvasiveLinkedListSynchronized{Task}
 global const Workqueues = [StickyWorkqueue()]
 global const Workqueue = Workqueues[1] # default work queue is thread 1
 function __preinit_threads__()
+    @eval Main import Base.MainInclude: eval, include
     if length(Workqueues) < Threads.nthreads()
         resize!(Workqueues, Threads.nthreads())
         for i = 2:length(Workqueues)

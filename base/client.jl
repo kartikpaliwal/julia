@@ -459,7 +459,6 @@ MainInclude.include
 function _start()
     empty!(ARGS)
     append!(ARGS, Core.ARGS)
-    @eval Main import Base.MainInclude: eval, include
     try
         exec_options(JLOptions())
     catch
